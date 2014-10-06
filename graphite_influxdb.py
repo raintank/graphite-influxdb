@@ -224,6 +224,7 @@ class InfluxdbFinder(object):
         try:
             from graphite_api.app import app
             self.cache = app.cache
+            self.mongo = app.mongo
         except:
             from django.core.cache import cache
             self.cache = cache
@@ -283,11 +284,17 @@ class InfluxdbFinder(object):
             for name in series:
                 if regex.match(name) is not None:
                     logger.debug("found leaf", name=name)
-                    res = 60  # fallback default
-                    for (rule_patt, rule_res) in self.schemas:
-                        if rule_patt.match(name):
-                            res = rule_res
-                            break
+                    if self.mongo:
+                        # query raintank DB for the interval that metrics are being stored at.
+                        metric = self.mongo.db.metrics.find_one(name)
+                        logger.debug(caller="get_leaves", metric=metric)
+                        res = metric.get('interval', 60)
+                    else:
+                        res = 60  # fallback default
+                        for (rule_patt, rule_res) in self.schemas:
+                            if rule_patt.match(name):
+                                res = rule_res
+                                break
                     leaves.append([name, res])
         with statsd.timer('service=graphite-api.action=cache_set_leaves.target_type=gauge.unit=ms'):
             self.cache.add(key_leaves, leaves, timeout=300)

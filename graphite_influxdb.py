@@ -218,7 +218,7 @@ class InfluxLeafNode(LeafNode):
 
 class InfluxdbFinder(object):
     __fetch_multi__ = 'influxdb'
-    __slots__ = ('client', 'schemas', 'cache')
+    __slots__ = ('client', 'schemas', 'cache', 'mongo')
 
     def __init__(self, config=None):
         try:

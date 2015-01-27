@@ -53,9 +53,9 @@ In your graphite-api config file::
        user: graphite
        pass: graphite
        db:   graphite
-       schema:
-         - ['', 60]
-         - ['high-res-metrics', 10]
+       ssl: false
+       es:
+         url: http://localhost:9200
 
 
 
@@ -63,8 +63,8 @@ Also enable the cache. memcache doesn't seem to work well because the list of se
 filesystem seems to work well::
 
     cache:
-        CACHE_TYPE: 'filesystem'
-        CACHE_DIR: '/tmp/graphite-api-cache'
+        type: 'filesystem'
+        dir: '/tmp/graphite-api-cache'
 
 
 Using with graphite-web
@@ -80,6 +80,7 @@ In graphite's ``local_settings.py``::
     INFLUXDB_USER = "graphite"
     INFLUXDB_PASS = "graphite"
     INFLUXDB_DB =  "graphite"
+    INFLUXDB_SSL = "false"
     INFLUXDB_SCHEMA = [
         ('', 60),
         ('high-res-metrics', 10)

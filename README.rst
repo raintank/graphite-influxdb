@@ -54,9 +54,8 @@ In your graphite-api config file::
        pass: graphite
        db:   graphite
        ssl: false
-       schema:
-         - ['', 60]
-         - ['high-res-metrics', 10]
+       es:
+         url: http://localhost:9200
 
 
 

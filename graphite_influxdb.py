@@ -1,10 +1,12 @@
 import re
 import time
+from elasticsearch import Elasticsearch
 
 # graphite-api and graphite-web have different logging systems
 try:
     from graphite_api.intervals import Interval, IntervalSet
     from graphite_api.node import LeafNode, BranchNode
+    from flask import g
     import structlog
     logger = structlog.get_logger()
 except ImportError:
@@ -91,7 +93,7 @@ def normalize_config(config=None):
         ret['db'] = cfg.get('db', 'graphite')
         ssl = cfg.get('ssl', False)
         ret['ssl'] = (ssl == 'true')
-        ret['schema'] = cfg.get('schema', [])
+        ret['es'] = cfg.get('es', {})
     else:
         from django.conf import settings
         ret['host'] = getattr(settings, 'INFLUXDB_HOST', 'localhost')
@@ -222,7 +224,7 @@ class InfluxLeafNode(LeafNode):
 
 class InfluxdbFinder(object):
     __fetch_multi__ = 'influxdb'
-    __slots__ = ('client', 'schemas', 'cache')
+    __slots__ = ('client', 'schemas', 'cache', 'es')
 
     def __init__(self, config=None):
         try:
@@ -234,12 +236,12 @@ class InfluxdbFinder(object):
 
         config = normalize_config(config)
         self.client = InfluxDBClient(config['host'], config['port'], config['user'], config['passw'], config['db'], config['ssl'])
-        self.schemas = [(re.compile(patt), step) for (patt, step) in config['schema']]
+        self.es = Elasticsearch([config['es']['url']])
 
     def assure_series(self, query):
         regex = self.compile_regex(query, True)
 
-        key_series = "%s_series" % query.pattern
+        key_series = "%s.%s_series" % (g.account, query.pattern)
         with statsd.timer('service=graphite-api.action=cache_get_series.target_type=gauge.unit=ms'):
             series = self.cache.get(key_series)
         if series is not None:
@@ -248,10 +250,31 @@ class InfluxdbFinder(object):
         # if not in cache, generate from scratch
         # first we must load the list with all nodes
         with statsd.timer('service=graphite-api.ext_service=influxdb.target_type=gauge.unit=ms.action=get_series'):
-            ret = self.client.query("list series /%s/" % regex.pattern)
-            # as long as influxdb doesn't have good safeguards against series with bad data in the metric names, we must filter out like so:
-            series = [serie[1] for serie in ret[0]['points'] if serie[1].encode('ascii', 'ignore') == serie[1]]
-
+            search_body = {
+              "query": {
+                "filtered": {
+                  "filter": {
+                    "term": {
+                      "account": g.account
+                      
+                    }
+                  },
+                  "query": {
+                    "regexp": {
+                    "name": regex.pattern
+                    }
+                  }
+                }
+              }
+            }
+            #print search_body
+            ret = self.es.search(index="definitions", doc_type="metric", body=search_body, fields=['name', 'interval'] )
+            #print "%s" % ret
+            series = []
+            if len(ret["hits"]["hits"]) > 0:
+                for hit in ret["hits"]["hits"] :
+                    series.append((hit["fields"]["name"][0], hit['fields']['interval'][0]))
+            
         # store in cache
         with statsd.timer('service=graphite-api.action=cache_set_series.target_type=gauge.unit=ms'):
             self.cache.add(key_series, series, timeout=300)
@@ -263,7 +286,7 @@ class InfluxdbFinder(object):
         # . becomes \.
 
         if series:
-            regex = '^{0}'
+            regex = '{0}.*'
         else:
             regex = '^{0}$'
 
@@ -274,7 +297,7 @@ class InfluxdbFinder(object):
         return re.compile(regex)
 
     def get_leaves(self, query):
-        key_leaves = "%s_leaves" % query.pattern
+        key_leaves = "%s.%s_leaves" % (g.account, query.pattern)
         with statsd.timer('service=graphite-api.action=cache_get_leaves.target_type=gauge.unit=ms'):
             data = self.cache.get(key_leaves)
         if data is not None:
@@ -284,14 +307,10 @@ class InfluxdbFinder(object):
         logger.debug(caller="get_leaves", key=key_leaves)
         leaves = []
         with statsd.timer('service=graphite-api.action=find_leaves.target_type=gauge.unit=ms'):
-            for name in series:
+            for name, res in series:
                 if regex.match(name) is not None:
                     logger.debug("found leaf", name=name)
-                    res = 60  # fallback default
-                    for (rule_patt, rule_res) in self.schemas:
-                        if rule_patt.match(name):
-                            res = rule_res
-                            break
+                    print "found leaf %s" % name
                     leaves.append([name, res])
         with statsd.timer('service=graphite-api.action=cache_set_leaves.target_type=gauge.unit=ms'):
             self.cache.add(key_leaves, leaves, timeout=300)
@@ -299,7 +318,7 @@ class InfluxdbFinder(object):
 
     def get_branches(self, query):
         seen_branches = set()
-        key_branches = "%s_branches" % query.pattern
+        key_branches = "%s.%s_branches" % (g.account, query.pattern)
         with statsd.timer('service=graphite-api.action=cache_get_branches.target_type=gauge.unit=ms'):
             data = self.cache.get(key_branches)
         if data is not None:
@@ -309,7 +328,7 @@ class InfluxdbFinder(object):
         logger.debug(caller="get_branches", key=key_branches)
         branches = []
         with statsd.timer('service=graphite-api.action=find_branches.target_type=gauge.unit=ms'):
-            for name in series:
+            for name, interval in series:
                 while '.' in name:
                     name = name.rsplit('.', 1)[0]
                     if name not in seen_branches:
@@ -330,7 +349,7 @@ class InfluxdbFinder(object):
                 yield BranchNode(name)
 
     def fetch_multi(self, nodes, start_time, end_time):
-        series = ', '.join(['"%s"' % node.path for node in nodes])
+        series = ', '.join(['"%d.%s"' % (g.account, node.path) for node in nodes])
         # use the step of the node that is the most coarse
         # not sure if there's a batter way? can we combine series with different steps (and use the optimal step for each?)
         # probably not

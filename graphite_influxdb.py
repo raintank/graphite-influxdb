@@ -123,9 +123,9 @@ class InfluxdbReader(object):
         # influx doesn't support <= and >= yet, hence the add.
         logger.debug(caller="fetch()", start_time=start_time, end_time=end_time, step=self.step, debug_key=self.path)
         with statsd.timer('service=graphite-api.ext_service=influxdb.target_type=gauge.unit=ms.what=query_individual_duration'):
-            data = self.client.query('select time, value from "%s" where time > %ds '
+            data = self.client.query('select time, value from "%s.%s" where time > %ds '
                                      'and time < %ds order asc' % (
-                                         self.path, start_time, end_time + 1))
+                                         g.account, self.path, start_time, end_time + 1))
 
         logger.debug(caller="fetch()", returned_data=data, debug_key=self.path)
 
@@ -268,7 +268,7 @@ class InfluxdbFinder(object):
               }
             }
             #print search_body
-            ret = self.es.search(index="definitions", doc_type="metric", body=search_body, fields=['name', 'interval'] )
+            ret = self.es.search(index="definitions", doc_type="metric", body=search_body, fields=['name', 'interval'], size=1000 )
             #print "%s" % ret
             series = []
             if len(ret["hits"]["hits"]) > 0:

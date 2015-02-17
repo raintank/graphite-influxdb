@@ -94,6 +94,7 @@ def normalize_config(config=None):
         ssl = cfg.get('ssl', False)
         ret['ssl'] = (ssl == 'true')
         ret['es'] = cfg.get('es', {})
+        ret['public_account'] = cfg.get('public_account', 1)
     else:
         from django.conf import settings
         ret['host'] = getattr(settings, 'INFLUXDB_HOST', 'localhost')
@@ -108,13 +109,14 @@ def normalize_config(config=None):
 
 
 class InfluxdbReader(object):
-    __slots__ = ('client', 'path', 'step', 'cache')
+    __slots__ = ('client', 'path', 'step', 'cache', 'public_account')
 
-    def __init__(self, client, path, step, cache):
+    def __init__(self, client, path, step, cache, public_account=None):
         self.client = client
         self.path = path
         self.step = step
         self.cache = cache
+        self.public_account = public_account
 
     def fetch(self, start_time, end_time):
         # in graphite,
@@ -123,9 +125,15 @@ class InfluxdbReader(object):
         # influx doesn't support <= and >= yet, hence the add.
         logger.debug(caller="fetch()", start_time=start_time, end_time=end_time, step=self.step, debug_key=self.path)
         with statsd.timer('service=graphite-api.ext_service=influxdb.target_type=gauge.unit=ms.what=query_individual_duration'):
+            prefix, step = InfluxdbFinder.get_prefix(start_time, end_time)
+            account = g.account
+            if self.path.startswith('public'):
+                account = self.public_account
+            series_name = "%s%s.%s" % (prefix, account, self.path)
+
             data = self.client.query('select time, value from "%s" where time > %ds '
                                      'and time < %ds order asc' % (
-                                         self.path, start_time, end_time + 1))
+                                         series_name, start_time, end_time + 1))
 
         logger.debug(caller="fetch()", returned_data=data, debug_key=self.path)
 
@@ -141,7 +149,7 @@ class InfluxdbReader(object):
         return time_info, datapoints
 
     @staticmethod
-    def fix_datapoints_multi(data, start_time, end_time, step, prefix):
+    def fix_datapoints_multi(data, start_time, end_time, step, series):
         out = {}
         """
         data looks like:
@@ -151,8 +159,8 @@ class InfluxdbReader(object):
             ....
         """
         for seriesdata in data:
-            if prefix is not None and seriesdata['name'].startswith(prefix):
-                seriesdata['name'] =  seriesdata['name'][len(prefix):]
+            if seriesdata['name'] in series:
+                seriesdata['name'] =  series[seriesdata['name']]['path']
             logger.debug(caller="fix_datapoints_multi", msg="invoking fix_datapoints()", debug_key=seriesdata['name'])
             datapoints = InfluxdbReader.fix_datapoints(seriesdata['points'], start_time, end_time, step, seriesdata['name'])
             out[seriesdata['name']] = datapoints
@@ -226,7 +234,7 @@ class InfluxLeafNode(LeafNode):
 
 class InfluxdbFinder(object):
     __fetch_multi__ = 'influxdb'
-    __slots__ = ('client', 'schemas', 'cache', 'es')
+    __slots__ = ('client', 'schemas', 'cache', 'es', 'public_account')
 
     def __init__(self, config=None):
         try:
@@ -239,6 +247,7 @@ class InfluxdbFinder(object):
         config = normalize_config(config)
         self.client = InfluxDBClient(config['host'], config['port'], config['user'], config['passw'], config['db'], config['ssl'])
         self.es = Elasticsearch([config['es']['url']])
+        self.public_account = config['public_account']
 
     def assure_series(self, query):
         regex = self.compile_regex(query, True)
@@ -252,32 +261,50 @@ class InfluxdbFinder(object):
         # if not in cache, generate from scratch
         # first we must load the list with all nodes
         with statsd.timer('service=graphite-api.ext_service=influxdb.target_type=gauge.unit=ms.action=get_series'):
-            search_body = {
-              "query": {
-                "filtered": {
-                  "filter": {
-                    "term": {
-                      "account": g.account
-                      
-                    }
-                  },
-                  "query": {
-                    "regexp": {
-                    "name": regex.pattern
-                    }
-                  }
-                }
-              }
-            }
-            ret = self.es.search(index="definitions", doc_type="metric", body=search_body, fields=['name', 'interval'], size=1000 )
-            series = []
-            if len(ret["hits"]["hits"]) > 0:
-                for hit in ret["hits"]["hits"] :
-                    series.append((hit["fields"]["name"][0], hit['fields']['interval'][0]))
+            if query.pattern.startswith('public.'):
+                #get public only
+                series = self.search_series(regex, public=True)
+            elif query.pattern.startswith('*'):
+                # get public and private
+                series = self.search_series(regex, public=True)
+                series.extend(self.search_series(regex, public=False))
+            else:
+                # get private only
+                series = self.search_series(regex, public=False)
             
         # store in cache
         with statsd.timer('service=graphite-api.action=cache_set_series.target_type=gauge.unit=ms'):
             self.cache.add(key_series, series, timeout=300)
+        return series
+
+    def search_series(self, regex, public=False):
+        account = g.account
+        if public:
+            account = self.public_account
+
+        search_body = {
+          "query": {
+            "filtered": {
+              "filter": {
+                "term": {
+                  "account": account
+                  
+                }
+              },
+              "query": {
+                "regexp": {
+                "name": regex.pattern
+                }
+              }
+            }
+          }
+        }
+        ret = self.es.search(index="definitions", doc_type="metric", body=search_body, fields=['name', 'interval'], size=1000 )
+        series = []
+        if len(ret["hits"]["hits"]) > 0:
+            for hit in ret["hits"]["hits"] :
+                series.append((hit["fields"]["name"][0], hit['fields']['interval'][0]))
+
         return series
 
     def compile_regex(self, query, series=False):
@@ -343,34 +370,44 @@ class InfluxdbFinder(object):
         # TODO: once we can query influx better for retention periods, honor the start/end time in the FindQuery object
         with statsd.timer('service=graphite-api.action=yield_nodes.target_type=gauge.unit=ms.what=query_duration'):
             for (name, res) in self.get_leaves(query):
-                yield InfluxLeafNode(name, InfluxdbReader(self.client, name, res, self.cache))
+                yield InfluxLeafNode(name, InfluxdbReader(self.client, name, res, self.cache, self.public_account))
             for name in self.get_branches(query):
                 yield BranchNode(name)
 
     def fetch_multi(self, nodes, start_time, end_time):
         prefix, step = InfluxdbFinder.get_prefix(start_time, end_time)
-        print "Prefix: %s" % prefix
-        series = ', '.join(['"%s%s"' % (prefix, node.path) for node in nodes])
+        series = {}
+        for node in nodes:
+            account = g.account
+            if node.path.startswith('public'):
+                account = self.public_account
+            name = "%s%s.%s" % (prefix, account, node.path)
+            series[name] = {
+                "prefix": "%s%s." % (prefix, account),
+                "path": node.path
+            }
+
+        series_list = ', '.join(series.keys())
         # use the step of the node that is the most coarse
         # not sure if there's a batter way? can we combine series with different steps (and use the optimal step for each?)
         # probably not
         if step is None:
             step = max([node.reader.step for node in nodes])
         query = 'select time, value from %s where time > %ds and time < %ds order asc' % (
-                series, start_time, end_time + 1)
+                series_list, start_time, end_time + 1)
         logger.debug(caller='fetch_multi', query=query)
         logger.debug(caller='fetch_multi', start_time=print_time(start_time), end_time=print_time(end_time), step=step)
         with statsd.timer('service=graphite-api.ext_service=influxdb.target_type=gauge.unit=ms.action=select_datapoints'):
             data = self.client.query(query)
         logger.debug(caller='fetch_multi', returned_data=data)
         if not len(data):
-            data = [{'name': "%s.%s" % (g.account, node.path), 'points': []} for node in nodes]
+            data = [{'name': name} for name in series.keys()]
             logger.debug(caller='fetch_multi', FIXING_DATA_TO=data)
         logger.debug(caller='fetch_multi', len_datapoints_before_fixing=len(data))
 
         with statsd.timer('service=graphite-api.action=fix_datapoints_multi.target_type=gauge.unit=ms'):
             logger.debug(caller='fetch_multi', action='invoking fix_datapoints_multi()')
-            datapoints = InfluxdbReader.fix_datapoints_multi(data, start_time, end_time, step, prefix)
+            datapoints = InfluxdbReader.fix_datapoints_multi(data, start_time, end_time, step, series)
 
         time_info = start_time, end_time, step
         return time_info, datapoints
@@ -381,7 +418,7 @@ class InfluxdbFinder(object):
         prefix = '';
         time_range = end_time - start_time
         res = None
-        print "now:%s start%s, end:%s" % (now, start_time, end_time)
+
         if (start_time < (now - 2678400)) or (time_range > 604800):
             # older then 31days or for a range of more then 7days then show 6hourly data.
             prefix = '6hour.avg.'
@@ -393,5 +430,4 @@ class InfluxdbFinder(object):
 
         #else show raw data.
 
-        prefix = '%s%d.' % (prefix, g.account)
         return prefix, res

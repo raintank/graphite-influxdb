@@ -261,7 +261,7 @@ class InfluxdbFinder(object):
         # if not in cache, generate from scratch
         # first we must load the list with all nodes
         with statsd.timer('service=graphite-api.ext_service=influxdb.target_type=gauge.unit=ms.action=get_series'):
-            if query.pattern.startswith('public.'):
+            if query.pattern.startswith('public'):
                 #get public only
                 series = self.search_series(regex, public=True)
             elif query.pattern.startswith('*'):

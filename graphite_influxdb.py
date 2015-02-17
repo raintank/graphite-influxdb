@@ -387,7 +387,7 @@ class InfluxdbFinder(object):
                 "path": node.path
             }
 
-        series_list = ', '.join(series.keys())
+        series_list = ', '.join(['"%s"' % key for key in series.keys()])
         # use the step of the node that is the most coarse
         # not sure if there's a batter way? can we combine series with different steps (and use the optimal step for each?)
         # probably not

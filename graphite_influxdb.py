@@ -401,7 +401,7 @@ class InfluxdbFinder(object):
             data = self.client.query(query)
         logger.debug(caller='fetch_multi', returned_data=data)
         if not len(data):
-            data = [{'name': name} for name in series.keys()]
+            data = [{'name': name, 'points': []} for name in series.keys()]
             logger.debug(caller='fetch_multi', FIXING_DATA_TO=data)
         logger.debug(caller='fetch_multi', len_datapoints_before_fixing=len(data))
 

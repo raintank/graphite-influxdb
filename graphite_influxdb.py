@@ -94,7 +94,7 @@ def normalize_config(config=None):
         ssl = cfg.get('ssl', False)
         ret['ssl'] = (ssl == 'true')
         ret['es'] = cfg.get('es', {})
-        ret['public_account'] = cfg.get('public_account', 1)
+        ret['public_org'] = cfg.get('public_org', 1)
     else:
         from django.conf import settings
         ret['host'] = getattr(settings, 'INFLUXDB_HOST', 'localhost')
@@ -109,14 +109,14 @@ def normalize_config(config=None):
 
 
 class InfluxdbReader(object):
-    __slots__ = ('client', 'path', 'step', 'cache', 'public_account')
+    __slots__ = ('client', 'path', 'step', 'cache', 'public_org')
 
-    def __init__(self, client, path, step, cache, public_account=None):
+    def __init__(self, client, path, step, cache, public_org=None):
         self.client = client
         self.path = path
         self.step = step
         self.cache = cache
-        self.public_account = public_account
+        self.public_org = public_org
 
     def fetch(self, start_time, end_time):
         # in graphite,
@@ -126,10 +126,10 @@ class InfluxdbReader(object):
         logger.debug(caller="fetch()", start_time=start_time, end_time=end_time, step=self.step, debug_key=self.path)
         with statsd.timer('service=graphite-api.ext_service=influxdb.target_type=gauge.unit=ms.what=query_individual_duration'):
             prefix, step = InfluxdbFinder.get_prefix(start_time, end_time)
-            account = g.account
+            org = g.org
             if self.path.startswith('public'):
-                account = self.public_account
-            series_name = "%s%s.%s" % (prefix, account, self.path)
+                org = self.public_org
+            series_name = "%s%s.%s" % (prefix, org, self.path)
 
             data = self.client.query('select time, value from "%s" where time > %ds '
                                      'and time < %ds order asc' % (
@@ -234,7 +234,7 @@ class InfluxLeafNode(LeafNode):
 
 class InfluxdbFinder(object):
     __fetch_multi__ = 'influxdb'
-    __slots__ = ('client', 'schemas', 'cache', 'es', 'public_account')
+    __slots__ = ('client', 'schemas', 'cache', 'es', 'public_org')
 
     def __init__(self, config=None):
         try:
@@ -247,12 +247,12 @@ class InfluxdbFinder(object):
         config = normalize_config(config)
         self.client = InfluxDBClient(config['host'], config['port'], config['user'], config['passw'], config['db'], config['ssl'])
         self.es = Elasticsearch([config['es']['url']])
-        self.public_account = config['public_account']
+        self.public_org = config['public_org']
 
     def assure_series(self, query):
         regex = self.compile_regex(query, True)
 
-        key_series = "%s.%s_series" % (g.account, query.pattern)
+        key_series = "%s.%s_series" % (g.org, query.pattern)
         with statsd.timer('service=graphite-api.action=cache_get_series.target_type=gauge.unit=ms'):
             series = self.cache.get(key_series)
         if series is not None:
@@ -278,16 +278,16 @@ class InfluxdbFinder(object):
         return series
 
     def search_series(self, regex, public=False):
-        account = g.account
+        org = g.org
         if public:
-            account = self.public_account
+            org = self.public_org
 
         search_body = {
           "query": {
             "filtered": {
               "filter": {
                 "term": {
-                  "account": account
+                  "org_id": org
                   
                 }
               },
@@ -324,7 +324,7 @@ class InfluxdbFinder(object):
         return re.compile(regex)
 
     def get_leaves(self, query):
-        key_leaves = "%s.%s_leaves" % (g.account, query.pattern)
+        key_leaves = "%s.%s_leaves" % (g.org, query.pattern)
         with statsd.timer('service=graphite-api.action=cache_get_leaves.target_type=gauge.unit=ms'):
             data = self.cache.get(key_leaves)
         if data is not None:
@@ -344,7 +344,7 @@ class InfluxdbFinder(object):
 
     def get_branches(self, query):
         seen_branches = set()
-        key_branches = "%s.%s_branches" % (g.account, query.pattern)
+        key_branches = "%s.%s_branches" % (g.org, query.pattern)
         with statsd.timer('service=graphite-api.action=cache_get_branches.target_type=gauge.unit=ms'):
             data = self.cache.get(key_branches)
         if data is not None:
@@ -370,7 +370,7 @@ class InfluxdbFinder(object):
         # TODO: once we can query influx better for retention periods, honor the start/end time in the FindQuery object
         with statsd.timer('service=graphite-api.action=yield_nodes.target_type=gauge.unit=ms.what=query_duration'):
             for (name, res) in self.get_leaves(query):
-                yield InfluxLeafNode(name, InfluxdbReader(self.client, name, res, self.cache, self.public_account))
+                yield InfluxLeafNode(name, InfluxdbReader(self.client, name, res, self.cache, self.public_org))
             for name in self.get_branches(query):
                 yield BranchNode(name)
 
@@ -378,12 +378,12 @@ class InfluxdbFinder(object):
         prefix, step = InfluxdbFinder.get_prefix(start_time, end_time)
         series = {}
         for node in nodes:
-            account = g.account
+            org = g.org
             if node.path.startswith('public'):
-                account = self.public_account
-            name = "%s%s.%s" % (prefix, account, node.path)
+                org = self.public_org
+            name = "%s%s.%s" % (prefix, org, node.path)
             series[name] = {
-                "prefix": "%s%s." % (prefix, account),
+                "prefix": "%s%s." % (prefix, org),
                 "path": node.path
             }
 

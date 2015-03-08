@@ -425,7 +425,7 @@ class InfluxdbFinder(object):
             res = 21600
         elif (start_time < now- 172800) or (time_range > 10800):
             #older then 7days or for a range of more then 3hours, then show 10minute data.
-            prefix = '10m.avg.'
+            prefix = '10min.avg.'
             res = 600
 
         #else show raw data.
